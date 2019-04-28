@@ -1,5 +1,6 @@
 /*
  *  openvpnmsica -- Custom Action DLL to provide OpenVPN-specific support to MSI packages
+ *                  https://community.openvpn.net/openvpn/wiki/OpenVPNMSICA
  *
  *  Copyright (C) 2018 Simon Rozman <simon@rozman.si>
  *
@@ -33,18 +34,28 @@
 
 
 /**
- * TLS data
+ * Thread local storage data
  */
-struct openvpnmsica_tls_data
+struct openvpnmsica_thread_data
 {
     MSIHANDLE hInstall; /** Handle to the installation session. */
 };
 
 
 /**
- * MSI session handle TLS index
+ * MSI session handle thread local storage index
  */
-extern DWORD openvpnmsica_tlsidx_session;
+extern DWORD openvpnmsica_thread_data_idx;
+
+
+/**
+ * Set MSI session handle in thread local storage.
+ */
+#define OPENVPNMSICA_SAVE_MSI_SESSION(hInstall) \
+{ \
+    struct openvpnmsica_thread_data *s = (struct openvpnmsica_thread_data *)TlsGetValue(openvpnmsica_thread_data_idx); \
+    s->hInstall = (hInstall); \
+}
 
 
 /*

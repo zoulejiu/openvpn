@@ -1,5 +1,6 @@
 /*
  *  openvpnmsica -- Custom Action DLL to provide OpenVPN-specific support to MSI packages
+ *                  https://community.openvpn.net/openvpn/wiki/OpenVPNMSICA
  *
  *  Copyright (C) 2018 Simon Rozman <simon@rozman.si>
  *
@@ -129,6 +130,12 @@ openvpnmsica_setup_sequence_filename(
     {
         size_t len_action_name_z = _tcslen(openvpnmsica_cleanup_action_seqs[i].szName) + 1;
         TCHAR *szPropertyEx = (TCHAR *)malloc((len_property_name + len_action_name_z) * sizeof(TCHAR));
+        if (szPropertyEx == NULL)
+        {
+            msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, (len_property_name + len_action_name_z) * sizeof(TCHAR));
+            return ERROR_OUTOFMEMORY;
+        }
+
         memcpy(szPropertyEx, szProperty, len_property_name * sizeof(TCHAR));
         memcpy(szPropertyEx + len_property_name, openvpnmsica_cleanup_action_seqs[i].szName, len_action_name_z * sizeof(TCHAR));
         _stprintf_s(
@@ -300,6 +307,10 @@ openvpnmsica_set_driver_certification(_In_ MSIHANDLE hInstall)
 
             free(pVersionInfo);
         }
+        else
+        {
+            msg(M_NONFATAL, "%s: malloc(%u) failed", __FUNCTION__, dwVerInfoSize);
+        }
     }
 
     uiResult = MsiSetProperty(hInstall, TEXT("DRIVERCERTIFICATION"), ver_info.dwMajorVersion >= 10 ? ver_info.wProductType > VER_NT_WORKSTATION ? TEXT("whql") : TEXT("attsgn") : TEXT(""));
@@ -355,40 +366,42 @@ openvpnmsica_set_openvpnserv_state(_In_ MSIHANDLE hInstall)
     /* Query service status. */
     SERVICE_STATUS_PROCESS ssp;
     DWORD dwBufSize;
-    if (!QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &dwBufSize))
+    if (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &dwBufSize))
+    {
+        switch (ssp.dwCurrentState)
+        {
+            case SERVICE_START_PENDING:
+            case SERVICE_RUNNING:
+            case SERVICE_STOP_PENDING:
+            case SERVICE_PAUSE_PENDING:
+            case SERVICE_PAUSED:
+            case SERVICE_CONTINUE_PENDING:
+            {
+                /* Service is started (kind of). Set OPENVPNSERVICE property to service PID. */
+                TCHAR szPID[10 /*MAXDWORD in decimal*/ + 1 /*terminator*/];
+                _stprintf_s(
+                    szPID, _countof(szPID),
+                    TEXT("%u"),
+                    ssp.dwProcessId);
+
+                uiResult = MsiSetProperty(hInstall, TEXT("OPENVPNSERVICE"), szPID);
+                if (uiResult != ERROR_SUCCESS)
+                {
+                    SetLastError(uiResult); /* MSDN does not mention MsiSetProperty() to set GetLastError(). But we do have an error code. Set last error manually. */
+                    msg(M_NONFATAL | M_ERRNO, "%s: MsiSetProperty(\"OPENVPNSERVICE\") failed", __FUNCTION__);
+                }
+
+                /* We know user is using the service. Skip auto-start setting check. */
+                goto cleanup_OpenService;
+            }
+            break;
+        }
+    }
+    else
     {
         uiResult = GetLastError();
         msg(M_NONFATAL | M_ERRNO, "%s: QueryServiceStatusEx(\"OpenVPNService\") failed", __FUNCTION__);
-        goto finish_QueryServiceStatusEx;
     }
-
-    switch (ssp.dwCurrentState)
-    {
-        case SERVICE_START_PENDING:
-        case SERVICE_RUNNING:
-        case SERVICE_STOP_PENDING:
-        case SERVICE_PAUSE_PENDING:
-        case SERVICE_PAUSED:
-        case SERVICE_CONTINUE_PENDING:
-        {
-            /* Set OPENVPNSERVICE property to service PID. */
-            TCHAR szPID[10 /*MAXDWORD in decimal*/ + 1 /*terminator*/];
-            _stprintf_s(
-                szPID, _countof(szPID),
-                TEXT("%u"),
-                ssp.dwProcessId);
-
-            uiResult = MsiSetProperty(hInstall, TEXT("OPENVPNSERVICE"), szPID);
-            if (uiResult != ERROR_SUCCESS)
-            {
-                SetLastError(uiResult); /* MSDN does not mention MsiSetProperty() to set GetLastError(). But we do have an error code. Set last error manually. */
-                msg(M_NONFATAL | M_ERRNO, "%s: MsiSetProperty(\"OPENVPNSERVICE\") failed", __FUNCTION__);
-            }
-            goto cleanup_OpenService;
-        }
-        break;
-    }
-finish_QueryServiceStatusEx:;
 
     /* Service is not started. Is it set to auto-start? */
     /* MSDN describes the maximum buffer size for QueryServiceConfig() to be 8kB. */
@@ -405,6 +418,7 @@ finish_QueryServiceStatusEx:;
 
     if (pQsc->dwStartType <= SERVICE_AUTO_START)
     {
+        /* Service is set to auto-start. Set OPENVPNSERVICE property to its path. */
         uiResult = MsiSetProperty(hInstall, TEXT("OPENVPNSERVICE"), pQsc->lpBinaryPathName);
         if (uiResult != ERROR_SUCCESS)
         {
@@ -435,9 +449,7 @@ FindSystemInfo(_In_ MSIHANDLE hInstall)
 
     BOOL bIsCoInitialized = SUCCEEDED(CoInitialize(NULL));
 
-    /* Set MSI session handle in TLS. */
-    struct openvpnmsica_tls_data *s = (struct openvpnmsica_tls_data *)TlsGetValue(openvpnmsica_tlsidx_session);
-    s->hInstall = hInstall;
+    OPENVPNMSICA_SAVE_MSI_SESSION(hInstall);
 
     openvpnmsica_set_driver_certification(hInstall);
     openvpnmsica_set_openvpnserv_state(hInstall);
@@ -462,13 +474,11 @@ FindTAPInterfaces(_In_ MSIHANDLE hInstall)
     UINT uiResult;
     BOOL bIsCoInitialized = SUCCEEDED(CoInitialize(NULL));
 
-    /* Set MSI session handle in TLS. */
-    struct openvpnmsica_tls_data *s = (struct openvpnmsica_tls_data *)TlsGetValue(openvpnmsica_tlsidx_session);
-    s->hInstall = hInstall;
+    OPENVPNMSICA_SAVE_MSI_SESSION(hInstall);
 
-    /* Get available network interfaces. */
+    /* Get all TUN/TAP network interfaces. */
     struct tap_interface_node *pInterfaceList = NULL;
-    uiResult = tap_list_interfaces(NULL, &pInterfaceList);
+    uiResult = tap_list_interfaces(NULL, &pInterfaceList, FALSE);
     if (uiResult != ERROR_SUCCESS)
     {
         goto cleanup_CoInitialize;
@@ -507,62 +517,39 @@ FindTAPInterfaces(_In_ MSIHANDLE hInstall)
         }
     }
 
-    /* Enumerate interfaces. */
-    struct interface_node
+    if (pInterfaceList != NULL)
     {
-        const struct tap_interface_node *iface;
-        struct interface_node *next;
-    } *interfaces_head = NULL, *interfaces_tail = NULL;
-    size_t interface_count = 0;
-    MSIHANDLE hRecord = MsiCreateRecord(1);
-    for (struct tap_interface_node *pInterface = pInterfaceList; pInterface; pInterface = pInterface->pNext)
-    {
-        for (LPCTSTR hwid = pInterface->szzHardwareIDs; hwid[0]; hwid += _tcslen(hwid) + 1)
+        /* Count interfaces. */
+        size_t interface_count = 0;
+        for (struct tap_interface_node *pInterface = pInterfaceList; pInterface; pInterface = pInterface->pNext)
         {
-            if (_tcsicmp(hwid, TEXT(TAP_WIN_COMPONENT_ID)) == 0
-                || _tcsicmp(hwid, TEXT("root\\") TEXT(TAP_WIN_COMPONENT_ID)) == 0)
-            {
-                /* TAP interface found. */
-
-                /* Report the GUID of the interface to installer. */
-                LPOLESTR szInterfaceId = NULL;
-                StringFromIID((REFIID)&pInterface->guid, &szInterfaceId);
-                MsiRecordSetString(hRecord, 1, szInterfaceId);
-                MsiProcessMessage(hInstall, INSTALLMESSAGE_ACTIONDATA, hRecord);
-                CoTaskMemFree(szInterfaceId);
-
-                /* Append interface to the list. */
-                struct interface_node *node = (struct interface_node *)malloc(sizeof(struct interface_node));
-                node->iface = pInterface;
-                node->next = NULL;
-                if (interfaces_head)
-                {
-                    interfaces_tail = interfaces_tail->next = node;
-                }
-                else
-                {
-                    interfaces_head = interfaces_tail = node;
-                }
-                interface_count++;
-                break;
-            }
+            interface_count++;
         }
-    }
-    MsiCloseHandle(hRecord);
 
-    if (interface_count)
-    {
         /* Prepare semicolon delimited list of TAP interface ID(s) and active TAP interface ID(s). */
         LPTSTR
-            szTAPInterfaces           = (LPTSTR)malloc(interface_count * (38 /*GUID*/ + 1 /*separator/terminator*/) * sizeof(TCHAR)),
-            szTAPInterfacesTail       = szTAPInterfaces,
+            szTAPInterfaces     = (LPTSTR)malloc(interface_count * (38 /*GUID*/ + 1 /*separator/terminator*/) * sizeof(TCHAR)),
+            szTAPInterfacesTail = szTAPInterfaces;
+        if (szTAPInterfaces == NULL)
+        {
+            msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, interface_count * (38 /*GUID*/ + 1 /*separator/terminator*/) * sizeof(TCHAR));
+            uiResult = ERROR_OUTOFMEMORY; goto cleanup_pAdapterAdresses;
+        }
+
+        LPTSTR
             szTAPInterfacesActive     = (LPTSTR)malloc(interface_count * (38 /*GUID*/ + 1 /*separator/terminator*/) * sizeof(TCHAR)),
             szTAPInterfacesActiveTail = szTAPInterfacesActive;
-        while (interfaces_head)
+        if (szTAPInterfacesActive == NULL)
+        {
+            msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, interface_count * (38 /*GUID*/ + 1 /*separator/terminator*/) * sizeof(TCHAR));
+            uiResult = ERROR_OUTOFMEMORY; goto cleanup_szTAPInterfaces;
+        }
+
+        for (struct tap_interface_node *pInterface = pInterfaceList; pInterface; pInterface = pInterface->pNext)
         {
             /* Convert interface GUID to UTF-16 string. (LPOLESTR defaults to LPWSTR) */
             LPOLESTR szInterfaceId = NULL;
-            StringFromIID((REFIID)&interfaces_head->iface->guid, &szInterfaceId);
+            StringFromIID((REFIID)&pInterface->guid, &szInterfaceId);
 
             /* Append to the list of TAP interface ID(s). */
             if (szTAPInterfaces < szTAPInterfacesTail)
@@ -575,11 +562,11 @@ FindTAPInterfaces(_In_ MSIHANDLE hInstall)
             /* If this interface is active (connected), add it to the list of active TAP interface ID(s). */
             for (PIP_ADAPTER_ADDRESSES p = pAdapterAdresses; p; p = p->Next)
             {
-                OLECHAR szId[38 + 1];
+                OLECHAR szId[38 /*GUID*/ + 1 /*terminator*/];
                 GUID guid;
                 if (MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, p->AdapterName, -1, szId, _countof(szId)) > 0
                     && SUCCEEDED(IIDFromString(szId, &guid))
-                    && memcmp(&guid, &interfaces_head->iface->guid, sizeof(GUID)) == 0)
+                    && memcmp(&guid, &pInterface->guid, sizeof(GUID)) == 0)
                 {
                     if (p->OperStatus == IfOperStatusUp)
                     {
@@ -595,10 +582,6 @@ FindTAPInterfaces(_In_ MSIHANDLE hInstall)
                 }
             }
             CoTaskMemFree(szInterfaceId);
-
-            struct interface_node *p = interfaces_head;
-            interfaces_head = interfaces_head->next;
-            free(p);
         }
         szTAPInterfacesTail      [0] = 0;
         szTAPInterfacesActiveTail[0] = 0;
@@ -609,7 +592,7 @@ FindTAPInterfaces(_In_ MSIHANDLE hInstall)
         {
             SetLastError(uiResult); /* MSDN does not mention MsiSetProperty() to set GetLastError(). But we do have an error code. Set last error manually. */
             msg(M_NONFATAL | M_ERRNO, "%s: MsiSetProperty(\"TAPINTERFACES\") failed", __FUNCTION__);
-            goto cleanup_szTAPInterfaces;
+            goto cleanup_szTAPInterfacesActive;
         }
 
         /* Set Installer ACTIVETAPINTERFACES property. */
@@ -618,11 +601,12 @@ FindTAPInterfaces(_In_ MSIHANDLE hInstall)
         {
             SetLastError(uiResult); /* MSDN does not mention MsiSetProperty() to set GetLastError(). But we do have an error code. Set last error manually. */
             msg(M_NONFATAL | M_ERRNO, "%s: MsiSetProperty(\"ACTIVETAPINTERFACES\") failed", __FUNCTION__);
-            goto cleanup_szTAPInterfaces;
+            goto cleanup_szTAPInterfacesActive;
         }
 
-cleanup_szTAPInterfaces:
+cleanup_szTAPInterfacesActive:
         free(szTAPInterfacesActive);
+cleanup_szTAPInterfaces:
         free(szTAPInterfaces);
     }
     else
@@ -630,6 +614,7 @@ cleanup_szTAPInterfaces:
         uiResult = ERROR_SUCCESS;
     }
 
+cleanup_pAdapterAdresses:
     free(pAdapterAdresses);
 cleanup_tap_list_interfaces:
     tap_free_interface_list(pInterfaceList);
@@ -677,9 +662,7 @@ StartOpenVPNGUI(_In_ MSIHANDLE hInstall)
     UINT uiResult;
     BOOL bIsCoInitialized = SUCCEEDED(CoInitialize(NULL));
 
-    /* Set MSI session handle in TLS. */
-    struct openvpnmsica_tls_data *s = (struct openvpnmsica_tls_data *)TlsGetValue(openvpnmsica_tlsidx_session);
-    s->hInstall = hInstall;
+    OPENVPNMSICA_SAVE_MSI_SESSION(hInstall);
 
     /* Create and populate a MSI record. */
     MSIHANDLE hRecord = MsiCreateRecord(1);
@@ -706,6 +689,12 @@ StartOpenVPNGUI(_In_ MSIHANDLE hInstall)
     {
         /* Allocate buffer on heap (+1 for terminator), and retry. */
         szPath = (LPTSTR)malloc((++dwPathSize) * sizeof(TCHAR));
+        if (szPath == NULL)
+        {
+            msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, dwPathSize * sizeof(TCHAR));
+            uiResult = ERROR_OUTOFMEMORY; goto cleanup_MsiCreateRecord;
+        }
+
         uiResult = MsiFormatRecord(hInstall, hRecord, szPath, &dwPathSize);
     }
     if (uiResult != ERROR_SUCCESS)
@@ -759,9 +748,7 @@ EvaluateTAPInterfaces(_In_ MSIHANDLE hInstall)
     UINT uiResult;
     BOOL bIsCoInitialized = SUCCEEDED(CoInitialize(NULL));
 
-    /* Set MSI session handle in TLS. */
-    struct openvpnmsica_tls_data *s = (struct openvpnmsica_tls_data *)TlsGetValue(openvpnmsica_tlsidx_session);
-    s->hInstall = hInstall;
+    OPENVPNMSICA_SAVE_MSI_SESSION(hInstall);
 
     /* List of deferred custom actions EvaluateTAPInterfaces prepares operation sequence for. */
     static const LPCTSTR szActionNames[] =
@@ -1052,9 +1039,7 @@ ProcessDeferredAction(_In_ MSIHANDLE hInstall)
     UINT uiResult;
     BOOL bIsCoInitialized = SUCCEEDED(CoInitialize(NULL));
 
-    /* Set MSI session handle in TLS. */
-    struct openvpnmsica_tls_data *s = (struct openvpnmsica_tls_data *)TlsGetValue(openvpnmsica_tlsidx_session);
-    s->hInstall = hInstall;
+    OPENVPNMSICA_SAVE_MSI_SESSION(hInstall);
 
     BOOL bIsCleanup = MsiGetMode(hInstall, MSIRUNMODE_COMMIT) || MsiGetMode(hInstall, MSIRUNMODE_ROLLBACK);
 

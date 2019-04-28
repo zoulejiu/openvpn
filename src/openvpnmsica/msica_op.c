@@ -1,5 +1,6 @@
 /*
  *  openvpnmsica -- Custom Action DLL to provide OpenVPN-specific support to MSI packages
+ *                  https://community.openvpn.net/openvpn/wiki/OpenVPNMSICA
  *
  *  Copyright (C) 2018 Simon Rozman <simon@rozman.si>
  *
@@ -85,6 +86,12 @@ msica_op_create_bool(
 
     /* Create and fill operation struct. */
     struct msica_op_bool *op = (struct msica_op_bool *)malloc(sizeof(struct msica_op_bool));
+    if (op == NULL)
+    {
+        msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, sizeof(struct msica_op_bool));
+        return NULL;
+    }
+
     op->base.type  = type;
     op->base.ticks = ticks;
     op->base.next  = next;
@@ -110,6 +117,12 @@ msica_op_create_string(
     /* Create and fill operation struct. */
     size_t value_size = (_tcslen(value) + 1) * sizeof(TCHAR);
     struct msica_op_string *op = (struct msica_op_string *)malloc(sizeof(struct msica_op_string) + value_size);
+    if (op == NULL)
+    {
+        msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, sizeof(struct msica_op_string) + value_size);
+        return NULL;
+    }
+
     op->base.type  = type;
     op->base.ticks = ticks;
     op->base.next  = next;
@@ -142,6 +155,12 @@ msica_op_create_multistring_va(
 
     /* Create and fill operation struct. */
     struct msica_op_multistring *op = (struct msica_op_multistring *)malloc(sizeof(struct msica_op_multistring) + value_size);
+    if (op == NULL)
+    {
+        msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, sizeof(struct msica_op_multistring) + value_size);
+        return NULL;
+    }
+
     op->base.type  = type;
     op->base.ticks = ticks;
     op->base.next  = next;
@@ -173,6 +192,12 @@ msica_op_create_guid(
 
     /* Create and fill operation struct. */
     struct msica_op_guid *op = (struct msica_op_guid *)malloc(sizeof(struct msica_op_guid));
+    if (op == NULL)
+    {
+        msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, sizeof(struct msica_op_guid));
+        return NULL;
+    }
+
     op->base.type  = type;
     op->base.ticks = ticks;
     op->base.next  = next;
@@ -199,6 +224,12 @@ msica_op_create_guid_string(
     /* Create and fill operation struct. */
     size_t value_str_size = (_tcslen(value_str) + 1) * sizeof(TCHAR);
     struct msica_op_guid_string *op = (struct msica_op_guid_string *)malloc(sizeof(struct msica_op_guid_string) + value_str_size);
+    if (op == NULL)
+    {
+        msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, sizeof(struct msica_op_guid_string) + value_str_size);
+        return NULL;
+    }
+
     op->base.type  = type;
     op->base.ticks = ticks;
     op->base.next  = next;
@@ -214,6 +245,11 @@ msica_op_seq_add_head(
     _Inout_ struct msica_op_seq *seq,
     _Inout_ struct msica_op *operation)
 {
+    if (seq == NULL || operation == NULL)
+    {
+        return;
+    }
+
     /* Insert list in the head. */
     struct msica_op *op;
     for (op = operation; op->next; op = op->next)
@@ -235,6 +271,11 @@ msica_op_seq_add_tail(
     _Inout_ struct msica_op_seq *seq,
     _Inout_ struct msica_op *operation)
 {
+    if (seq == NULL || operation == NULL)
+    {
+        return;
+    }
+
     /* Append list to the tail. */
     struct msica_op *op;
     for (op = operation; op->next; op = op->next)
@@ -324,6 +365,11 @@ msica_op_seq_load(
 {
     DWORD dwRead;
 
+    if (seq == NULL)
+    {
+        return ERROR_BAD_ARGUMENTS;
+    }
+
     seq->head = seq->tail = NULL;
 
     for (;;)
@@ -345,10 +391,18 @@ msica_op_seq_load(
             msg(M_NONFATAL, "%s: Incomplete ReadFile", __FUNCTION__);
             return ERROR_INVALID_DATA;
         }
+
         struct msica_op *op = (struct msica_op *)malloc(sizeof(struct msica_op) + hdr.size_data);
+        if (op == NULL)
+        {
+            msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, sizeof(struct msica_op) + hdr.size_data);
+            return ERROR_OUTOFMEMORY;
+        }
+
         op->type  = hdr.type;
         op->ticks = hdr.ticks;
         op->next  = NULL;
+
         if (!ReadFile(hFile, op + 1, hdr.size_data, &dwRead, NULL))
         {
             DWORD dwResult = GetLastError();
@@ -361,6 +415,7 @@ msica_op_seq_load(
             msg(M_NONFATAL, "%s: Incomplete ReadFile", __FUNCTION__);
             return ERROR_INVALID_DATA;
         }
+
         msica_op_seq_add_tail(seq, op);
     }
 }
@@ -389,9 +444,9 @@ msica_op_tap_interface_create_exec(
         }
     }
 
-    /* Get available network interfaces. */
+    /* Get all available network interfaces. */
     struct tap_interface_node *pInterfaceList = NULL;
-    DWORD dwResult = tap_list_interfaces(NULL, &pInterfaceList);
+    DWORD dwResult = tap_list_interfaces(NULL, &pInterfaceList, TRUE);
     if (dwResult == ERROR_SUCCESS)
     {
         /* Does interface exist? */
@@ -544,9 +599,9 @@ msica_op_tap_interface_delete_by_name_exec(
         }
     }
 
-    /* Get available network interfaces. */
+    /* Get available TUN/TAP interfaces. */
     struct tap_interface_node *pInterfaceList = NULL;
-    DWORD dwResult = tap_list_interfaces(NULL, &pInterfaceList);
+    DWORD dwResult = tap_list_interfaces(NULL, &pInterfaceList, FALSE);
     if (dwResult == ERROR_SUCCESS)
     {
         /* Does interface exist? */
@@ -602,9 +657,9 @@ msica_op_tap_interface_delete_by_guid_exec(
         }
     }
 
-    /* Get available network interfaces. */
+    /* Get all available interfaces. */
     struct tap_interface_node *pInterfaceList = NULL;
-    DWORD dwResult = tap_list_interfaces(NULL, &pInterfaceList);
+    DWORD dwResult = tap_list_interfaces(NULL, &pInterfaceList, TRUE);
     if (dwResult == ERROR_SUCCESS)
     {
         /* Does interface exist? */
@@ -661,9 +716,9 @@ msica_op_tap_interface_set_name_exec(
         }
     }
 
-    /* Get available network interfaces. */
+    /* Get all available network interfaces. */
     struct tap_interface_node *pInterfaceList = NULL;
-    DWORD dwResult = tap_list_interfaces(NULL, &pInterfaceList);
+    DWORD dwResult = tap_list_interfaces(NULL, &pInterfaceList, TRUE);
     if (dwResult == ERROR_SUCCESS)
     {
         /* Does interface exist? */
@@ -753,6 +808,12 @@ msica_op_file_delete_exec(
     {
         size_t sizeNameBackupLenZ = _tcslen(op->value) + 7 /*" (orig "*/ + 10 /*maximum int*/ + 1 /*")"*/ + 1 /*terminator*/;
         LPTSTR szNameBackup = (LPTSTR)malloc(sizeNameBackupLenZ * sizeof(TCHAR));
+        if (szNameBackup == NULL)
+        {
+            msg(M_FATAL, "%s: malloc(%u) failed", __FUNCTION__, sizeNameBackupLenZ * sizeof(TCHAR));
+            return ERROR_OUTOFMEMORY;
+        }
+
         int count = 0;
 
         do
